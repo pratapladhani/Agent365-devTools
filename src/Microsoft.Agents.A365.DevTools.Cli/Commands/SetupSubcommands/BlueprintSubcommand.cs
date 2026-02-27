@@ -610,6 +610,24 @@ internal static class BlueprintSubcommand
         // Display verification info and summary
         await SetupHelpers.DisplayVerificationInfoAsync(config, logger);
 
+        // Reconcile custom blueprint permissions — apply desired and remove stale entries.
+        // Always run (even when config is empty) so that permissions removed from config are
+        // also removed from Azure AD.
+        // (When isSetupAll, AllSubcommand handles this at Step 5 — do not apply twice.)
+        if (!isSetupAll)
+        {
+            await PermissionsSubcommand.ConfigureCustomPermissionsAsync(
+                config.FullName,
+                logger,
+                configService,
+                executor,
+                graphApiService,
+                blueprintService,
+                setupConfig,
+                isSetupAll: false,
+                cancellationToken: cancellationToken);
+        }
+
         if (!isSetupAll)
         {
             logger.LogInformation("Next steps:");
