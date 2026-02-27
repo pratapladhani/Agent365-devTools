@@ -220,18 +220,14 @@ public class AuthenticationService
                 _logger.LogInformation("Please sign in with your Microsoft account and grant consent for the requested permissions.");
                 _logger.LogInformation("");
 
-                credential = new MsalBrowserCredential(
-                    effectiveClientId,
-                    effectiveTenantId,
-                    redirectUri: null,  // Let MsalBrowserCredential use WAM on Windows
-                    _logger);
+                credential = CreateBrowserCredential(effectiveClientId, effectiveTenantId);
             }
             else
             {
                 // Device code flow - works in all environments including SSH/remote sessions
                 _logger.LogInformation("Using device code authentication...");
                 _logger.LogInformation("Please sign in with your Microsoft account");
-                credential = CreateDeviceCodeCredential(effectiveTenantId, effectiveClientId);
+                credential = CreateDeviceCodeCredential(effectiveClientId, effectiveTenantId);
             }
 
             var tokenRequestContext = new TokenRequestContext(scopes);
@@ -245,7 +241,7 @@ public class AuthenticationService
                 _logger.LogWarning("Browser authentication is not supported on this platform, falling back to device code flow...");
                 _logger.LogInformation("Using device code authentication...");
                 _logger.LogInformation("Please sign in with your Microsoft account");
-                var deviceCodeCredential = CreateDeviceCodeCredential(effectiveTenantId, effectiveClientId);
+                var deviceCodeCredential = CreateDeviceCodeCredential(effectiveClientId, effectiveTenantId);
                 tokenResult = await deviceCodeCredential.GetTokenAsync(tokenRequestContext, default);
             }
 
@@ -514,11 +510,19 @@ public class AuthenticationService
     }
 
     /// <summary>
+    /// Creates a browser credential for interactive authentication.
+    /// Protected virtual to allow substitution in tests.
+    /// </summary>
+    protected virtual TokenCredential CreateBrowserCredential(string clientId, string tenantId)
+        => new MsalBrowserCredential(clientId, tenantId, redirectUri: null, _logger);
+
+    /// <summary>
     /// Creates a DeviceCodeCredential configured for interactive device code authentication.
     /// This flow works in all environments including SSH, remote sessions, and platforms where
     /// browser-based authentication is unavailable.
+    /// Protected virtual to allow substitution in tests.
     /// </summary>
-    private DeviceCodeCredential CreateDeviceCodeCredential(string tenantId, string clientId)
+    protected virtual TokenCredential CreateDeviceCodeCredential(string clientId, string tenantId)
     {
         return new DeviceCodeCredential(new DeviceCodeCredentialOptions
         {
