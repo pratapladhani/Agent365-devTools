@@ -5,10 +5,12 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Azure.Core;
 using Microsoft.Agents.A365.DevTools.Cli.Constants;
 using Microsoft.Agents.A365.DevTools.Cli.Helpers;
 using Microsoft.Extensions.Logging;
@@ -117,13 +119,28 @@ public sealed class MicrosoftGraphTokenProvider : IMicrosoftGraphTokenProvider, 
                 return cached.AccessToken;
             }
 
-            _logger.LogInformation(
-                "Acquiring Microsoft Graph delegated access token via PowerShell (Device Code: {UseDeviceCode})",
-                useDeviceCode);
+            _logger.LogInformation("Acquiring Microsoft Graph delegated access token via PowerShell...");
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                _logger.LogInformation("A browser window will open for authentication. Complete sign-in, then return here — the CLI will continue automatically.");
+            }
+            else
+            {
+                _logger.LogInformation("A device code prompt will appear below. Open the URL in any browser, enter the code, complete sign-in, then return here — the CLI will continue automatically.");
+            }
 
             var script = BuildPowerShellScript(tenantId, validatedScopes, useDeviceCode, clientAppId);
             var result = await ExecuteWithFallbackAsync(script, ct);
             var token = ProcessResult(result);
+
+            // If PS Connect-MgGraph fails for any reason (no TTY on Linux, NullRef in DeviceCodeCredential,
+            // module issues, etc.), fall back to MSAL. On Windows this uses WAM; on Linux/macOS it uses
+            // device code. The acquired token is stored in _tokenCache below so subsequent calls
+            // (inheritable permissions, custom permissions) hit the cache without re-prompting.
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                token = await AcquireGraphTokenViaMsalAsync(tenantId, validatedScopes, clientAppId, ct);
+            }
 
             if (string.IsNullOrWhiteSpace(token))
             {
@@ -204,23 +221,20 @@ public sealed class MicrosoftGraphTokenProvider : IMicrosoftGraphTokenProvider, 
             ? $" -ClientId '{CommandStringHelper.EscapePowerShellString(clientAppId)}'" 
             : "";
 
-        // Workaround for older Microsoft.Graph versions that don't have Get-MgAccessToken
-        // We make a dummy Graph request and extract the token from the Authorization header
+        // Extract the access token from the Authorization header of a live Graph request.
+        // $ctx.AccessToken is NOT used because Microsoft.Graph.Authentication v2+ returns an
+        // opaque (non-JWT) value that is rejected when used as a Bearer token in Graph API calls.
+        // The Authorization header on an actual request always contains the real JWT Bearer token.
         return
             $"Import-Module Microsoft.Graph.Authentication -ErrorAction Stop; " +
             $"Connect-MgGraph -TenantId '{escapedTenantId}'{clientIdParam} -Scopes {scopesArray} {authMethod} -NoWelcome -ErrorAction Stop; " +
             $"$ctx = Get-MgContext; " +
             $"if ($null -eq $ctx) {{ throw 'Failed to establish Graph context' }}; " +
-            // Try to get token directly if available (newer versions)
-            $"if ($ctx.PSObject.Properties.Name -contains 'AccessToken' -and -not [string]::IsNullOrWhiteSpace($ctx.AccessToken)) {{ " +
-            $"  $ctx.AccessToken " +
-            $"}} else {{ " +
-            // Fallback: Extract token from a test Graph request (older versions)
-            $"  $response = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/$metadata' -OutputType HttpResponseMessage -ErrorAction Stop; " +
-            $"  $token = $response.RequestMessage.Headers.Authorization.Parameter; " +
-            $"  if ([string]::IsNullOrWhiteSpace($token)) {{ throw 'Failed to extract access token from request' }}; " +
-            $"  $token " +
-            $"}}";
+            $"$response = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/$metadata' -OutputType HttpResponseMessage -ErrorAction Stop; " +
+            $"$token = $response.RequestMessage.Headers.Authorization.Parameter; " +
+            $"$response.Dispose(); " +
+            $"if ([string]::IsNullOrWhiteSpace($token)) {{ throw 'Failed to extract access token from Graph request headers' }}; " +
+            $"$token";
     }
 
     private static string BuildScopesArray(string[] scopes)
@@ -234,16 +248,110 @@ public sealed class MicrosoftGraphTokenProvider : IMicrosoftGraphTokenProvider, 
         CancellationToken ct)
     {
         // Try PowerShell Core first (cross-platform)
-        var result = await ExecutePowerShellAsync("pwsh", script, ct);
+        var shell = "pwsh";
+        var result = await ExecutePowerShellAsync(shell, script, ct);
 
         // Fallback to Windows PowerShell if pwsh is not available
         if (!result.Success && IsPowerShellNotFoundError(result))
         {
             _logger.LogDebug("PowerShell Core not found, falling back to Windows PowerShell");
-            result = await ExecutePowerShellAsync("powershell", script, ct);
+            shell = "powershell";
+            result = await ExecutePowerShellAsync(shell, script, ct);
+        }
+
+        // If the failure is due to a missing or broken module, attempt auto-install and retry once.
+        // This handles cases where Get-Module -ListAvailable reports the module as present but
+        // Import-Module fails at runtime (e.g., corrupt install, partial uninstall, path mismatch).
+        if (!result.Success && IsPowerShellModuleMissingError(result))
+        {
+            if (await TryAutoInstallRequiredModulesAsync(shell, ct))
+            {
+                _logger.LogInformation("Auto-installed missing PowerShell module(s). Retrying...");
+                result = await ExecutePowerShellAsync(shell, script, ct);
+            }
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Acquires a Microsoft Graph access token via MSAL as a fallback when PowerShell
+    /// Connect-MgGraph fails for any reason. On Windows uses WAM; on Linux/macOS uses device code.
+    /// Uses MsalBrowserCredential which shares the static in-process token cache, so a token
+    /// acquired here is reused silently on subsequent calls within the same CLI invocation.
+    /// </summary>
+    private async Task<string?> AcquireGraphTokenViaMsalAsync(
+        string tenantId,
+        string[] scopes,
+        string? clientAppId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(clientAppId))
+        {
+            _logger.LogDebug("No client app ID available for MSAL Graph fallback.");
+            return null;
+        }
+
+        try
+        {
+            // MSAL requires fully-qualified scope URIs; PS Connect-MgGraph handles this internally.
+            var fullScopes = scopes
+                .Select(s => s.Contains("://", StringComparison.Ordinal) ? s : $"https://graph.microsoft.com/{s}")
+                .ToArray();
+
+            _logger.LogDebug("Acquiring Graph token via MSAL for scopes: {Scopes}", string.Join(", ", fullScopes));
+
+            var msalCredential = new MsalBrowserCredential(clientAppId, tenantId, logger: _logger);
+            var tokenResult = await msalCredential.GetTokenAsync(new TokenRequestContext(fullScopes), ct);
+
+            if (string.IsNullOrWhiteSpace(tokenResult.Token))
+                return null;
+
+            _logger.LogInformation("Microsoft Graph access token acquired via MSAL fallback.");
+            return tokenResult.Token;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "MSAL Graph token fallback failed: {Message}", ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Attempts to auto-install the PowerShell modules required for Graph token acquisition.
+    /// Returns true if installation succeeded, false otherwise.
+    /// </summary>
+    private async Task<bool> TryAutoInstallRequiredModulesAsync(string shell, CancellationToken ct)
+    {
+        _logger.LogInformation("Detected missing or broken PowerShell module. Attempting auto-install...");
+        try
+        {
+            var installScript =
+                "Install-Module -Name 'Microsoft.Graph.Authentication' -Repository 'PSGallery' -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop; " +
+                "Install-Module -Name 'Microsoft.Graph.Applications' -Repository 'PSGallery' -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop";
+            var result = await ExecutePowerShellAsync(shell, installScript, ct);
+            if (result.Success)
+            {
+                _logger.LogInformation("PowerShell modules auto-installed successfully.");
+                return true;
+            }
+            _logger.LogWarning("Auto-install of PowerShell modules failed: {Error}", result.StandardError);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Auto-install of PowerShell modules threw an exception: {Error}", ex.Message);
+            return false;
+        }
+    }
+
+    private static bool IsPowerShellModuleMissingError(CommandResult result)
+    {
+        if (string.IsNullOrWhiteSpace(result.StandardError)) return false;
+        var error = result.StandardError;
+        return error.Contains("module", StringComparison.OrdinalIgnoreCase) &&
+               (error.Contains("was not loaded", StringComparison.OrdinalIgnoreCase) ||
+                error.Contains("not found in any module", StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task<CommandResult> ExecutePowerShellAsync(
@@ -259,7 +367,44 @@ public sealed class MicrosoftGraphTokenProvider : IMicrosoftGraphTokenProvider, 
             workingDirectory: null,
             outputPrefix: "",
             interactive: true,
+            outputTransform: FormatDeviceCodeLine,
             cancellationToken: ct);
+    }
+
+    /// <summary>
+    /// Intercepts the PS Connect-MgGraph device code line and reformats it to match the MSAL box format.
+    /// Input:  "To sign in, use a web browser to open the page {url} and enter the code {code} to authenticate."
+    /// Output: the MSAL-style === box with URL and code on separate lines.
+    /// Returns null to suppress the original line; returns the line unchanged for all other output.
+    /// </summary>
+    private static string? FormatDeviceCodeLine(string line)
+    {
+        const string marker = "To sign in, use a web browser to open the page ";
+        const string codeMarker = " and enter the code ";
+        const string suffix = " to authenticate.";
+
+        if (!line.Contains(marker, StringComparison.OrdinalIgnoreCase))
+            return line;
+
+        try
+        {
+            var pageStart = line.IndexOf(marker, StringComparison.OrdinalIgnoreCase) + marker.Length;
+            var codeStart = line.IndexOf(codeMarker, pageStart, StringComparison.OrdinalIgnoreCase);
+            if (codeStart < 0) return line;
+
+            var url = line[pageStart..codeStart].Trim();
+            var codeEnd = line.IndexOf(suffix, codeStart + codeMarker.Length, StringComparison.OrdinalIgnoreCase);
+            var code = codeEnd >= 0
+                ? line[(codeStart + codeMarker.Length)..codeEnd].Trim()
+                : line[(codeStart + codeMarker.Length)..].Trim();
+
+            var sep = new string('=', 74);
+            return $"{sep}\nTo sign in, use a web browser to open the page:\n    {url}\nAnd enter the code: {code}\n{sep}";
+        }
+        catch
+        {
+            return line;
+        }
     }
 
     private static string BuildPowerShellArguments(string shell, string script)
@@ -280,10 +425,25 @@ public sealed class MicrosoftGraphTokenProvider : IMicrosoftGraphTokenProvider, 
             _logger.LogError(
                 "Failed to acquire Microsoft Graph access token. Error: {Error}",
                 result.StandardError);
+
+            if (IsPowerShellModuleMissingError(result))
+            {
+                _logger.LogError(
+                    "Required PowerShell module could not be loaded (auto-install was attempted but failed). " +
+                    "Run 'a365 setup requirements' to manually install missing modules.");
+            }
+
             return null;
         }
 
-        var token = result.StandardOutput?.Trim();
+        // The script ends with `$token`, which outputs the JWT as the last line.
+        // Connect-MgGraph may also write informational messages (e.g. device code prompt)
+        // to stdout in non-interactive environments. Extract only the last non-empty line
+        // so those messages do not contaminate the token.
+        var token = result.StandardOutput?
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.Trim())
+            .LastOrDefault(l => !string.IsNullOrWhiteSpace(l));
 
         if (string.IsNullOrWhiteSpace(token))
         {

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Microsoft.Agents.A365.DevTools.Cli.Constants;
+using Microsoft.Agents.A365.DevTools.Cli.Exceptions;
 using Microsoft.Agents.A365.DevTools.Cli.Helpers;
 using Microsoft.Agents.A365.DevTools.Cli.Models;
 using Microsoft.Agents.A365.DevTools.Cli.Services;
@@ -63,13 +64,27 @@ internal static class CopilotStudioSubcommand
             if (string.IsNullOrWhiteSpace(setupConfig.AgentBlueprintId))
             {
                 logger.LogError("Blueprint ID not found. Run 'a365 setup blueprint' first.");
-                Environment.Exit(1);
+                ExceptionHandler.ExitWithCleanup(1);
             }
 
             // Configure GraphApiService with custom client app ID if available
             if (!string.IsNullOrWhiteSpace(setupConfig.ClientAppId))
             {
                 graphApiService.CustomClientAppId = setupConfig.ClientAppId;
+            }
+
+            // Verify system requirements (PowerShell modules are required for Graph operations).
+            // Skipped in dry-run: PowerShellModulesRequirementCheck can auto-install modules,
+            // which would be a side effect in a mode that is supposed to be non-mutating.
+            if (!dryRun)
+            {
+                var systemChecksOk = await RequirementsSubcommand.RunRequirementChecksAsync(
+                    RequirementsSubcommand.GetSystemRequirementChecks(), setupConfig, logger, category: null, CancellationToken.None);
+                if (!systemChecksOk)
+                {
+                    logger.LogError("Setup cannot proceed due to failed requirement checks above. Please fix the issues and retry.");
+                    ExceptionHandler.ExitWithCleanup(1);
+                }
             }
 
             if (dryRun)

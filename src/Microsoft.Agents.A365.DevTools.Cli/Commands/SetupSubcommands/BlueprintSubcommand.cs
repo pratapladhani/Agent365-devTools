@@ -154,14 +154,20 @@ internal static class BlueprintSubcommand
             "--update-endpoint",
             description: "Delete the existing messaging endpoint and register a new one with the specified URL");
 
+        var skipRequirementsOption = new Option<bool>(
+            "--skip-requirements",
+            description: "Skip requirements validation check\n" +
+                        "Use with caution: setup may fail if prerequisites are not met");
+
         command.AddOption(configOption);
         command.AddOption(verboseOption);
         command.AddOption(dryRunOption);
         command.AddOption(skipEndpointRegistrationOption);
         command.AddOption(endpointOnlyOption);
         command.AddOption(updateEndpointOption);
+        command.AddOption(skipRequirementsOption);
 
-        command.SetHandler(async (config, verbose, dryRun, skipEndpointRegistration, endpointOnly, updateEndpoint) =>
+        command.SetHandler(async (config, verbose, dryRun, skipEndpointRegistration, endpointOnly, updateEndpoint, skipRequirements) =>
         {
             // Generate correlation ID at workflow entry point
             var correlationId = HttpClientFactory.GenerateCorrelationId();
@@ -213,6 +219,37 @@ internal static class BlueprintSubcommand
                     ExceptionHandler.ExitWithCleanup(1);
                 }
                 return;
+            }
+
+            // Run all requirements checks: system checks (PowerShell modules, Frontier Preview)
+            // and config checks (Location, ClientApp — includes isFallbackPublicClient auto-fix
+            // required for device code auth on macOS/Linux/WSL).
+            // Skip when dryRun is true: ClientAppRequirementCheck can mutate the app registration
+            // (e.g., set isFallbackPublicClient), which violates dry-run semantics.
+            if (!skipRequirements && !dryRun)
+            {
+                try
+                {
+                    var requirementsResult = await RequirementsSubcommand.RunRequirementChecksAsync(
+                        RequirementsSubcommand.GetRequirementChecks(clientAppValidator),
+                        setupConfig,
+                        logger,
+                        category: null,
+                        CancellationToken.None);
+
+                    if (!requirementsResult)
+                    {
+                        logger.LogError("Setup cannot proceed due to the failed requirement checks above. Please fix the issues above and then try again.");
+                        logger.LogError("Use the resolution guidance provided for each failed check.");
+                        ExceptionHandler.ExitWithCleanup(1);
+                    }
+                }
+                catch (Exception reqEx)
+                {
+                    logger.LogError(reqEx, "Requirements check failed with an unexpected error: {Message}", reqEx.Message);
+                    logger.LogError("If you want to bypass requirement validation, rerun this command with the --skip-requirements flag.");
+                    ExceptionHandler.ExitWithCleanup(1);
+                }
             }
 
             if (dryRun)
@@ -281,7 +318,7 @@ internal static class BlueprintSubcommand
                 correlationId: correlationId
                 );
 
-        }, configOption, verboseOption, dryRunOption, skipEndpointRegistrationOption, endpointOnlyOption, updateEndpointOption);
+        }, configOption, verboseOption, dryRunOption, skipEndpointRegistrationOption, endpointOnlyOption, updateEndpointOption, skipRequirementsOption);
 
         return command;
     }
@@ -773,7 +810,9 @@ internal static class BlueprintSubcommand
             if (string.IsNullOrWhiteSpace(existingServicePrincipalId))
             {
                 logger.LogDebug("Looking up service principal for blueprint...");
-                var spLookup = await blueprintLookupService.GetServicePrincipalByAppIdAsync(tenantId, existingAppId, ct);
+                var spLookup = await blueprintLookupService.GetServicePrincipalByAppIdAsync(
+                    tenantId, existingAppId, ct,
+                    scopes: AuthenticationConstants.RequiredPermissionGrantScopes);
                 
                 if (spLookup.Found)
                 {
@@ -1339,6 +1378,20 @@ internal static class BlueprintSubcommand
         var applicationScopes = GetApplicationScopes(setupConfig, logger);
         bool consentAlreadyExists = false;
 
+        // Resolve blueprint SP object ID once — reused by both pre-check and polling.
+        // servicePrincipalId comes from generated config (persisted on previous runs).
+        // If absent, look it up using MSAL scopes that include Application.Read.All.
+        // Without Application.Read.All the az CLI token causes Graph to return empty results silently.
+        var blueprintSpId = servicePrincipalId;
+        if (string.IsNullOrWhiteSpace(blueprintSpId))
+        {
+            logger.LogDebug("Looking up service principal for blueprint...");
+            var spLookup = await blueprintLookupService.GetServicePrincipalByAppIdAsync(
+                tenantId, appId, ct,
+                scopes: AuthenticationConstants.RequiredPermissionGrantScopes);
+            blueprintSpId = spLookup.ObjectId;
+        }
+
         // Only check for existing consent if blueprint already existed
         // New blueprints cannot have consent yet, so skip the verification
         if (alreadyExisted)
@@ -1346,22 +1399,14 @@ internal static class BlueprintSubcommand
             logger.LogInformation("Verifying admin consent for application");
             logger.LogDebug("  - Application scopes: {Scopes}", string.Join(", ", applicationScopes));
 
-            // Check if consent already exists with required scopes
-            var blueprintSpId = servicePrincipalId;
-            if (string.IsNullOrWhiteSpace(blueprintSpId))
-            {
-                logger.LogDebug("Looking up service principal for blueprint to check consent...");
-                var spLookup = await blueprintLookupService.GetServicePrincipalByAppIdAsync(tenantId, appId, ct);
-                blueprintSpId = spLookup.ObjectId;
-            }
-
             if (!string.IsNullOrWhiteSpace(blueprintSpId))
             {
-                // Get Microsoft Graph service principal ID
+                // Get Microsoft Graph service principal ID (needs Application.Read.All)
                 var graphSpId = await graphApiService.LookupServicePrincipalByAppIdAsync(
                     tenantId,
                     AuthenticationConstants.MicrosoftGraphResourceAppId,
-                    ct);
+                    ct,
+                    AuthenticationConstants.RequiredPermissionGrantScopes);
 
                 if (!string.IsNullOrWhiteSpace(graphSpId))
                 {
@@ -1373,7 +1418,8 @@ internal static class BlueprintSubcommand
                         graphSpId,
                         applicationScopes,
                         logger,
-                        ct);
+                        ct,
+                        scopes: AuthenticationConstants.RequiredPermissionGrantScopes);
                 }
             }
 
@@ -1428,9 +1474,21 @@ internal static class BlueprintSubcommand
         logger.LogInformation("Requesting admin consent for application");
         logger.LogInformation("  - Application scopes: {Scopes}", string.Join(", ", applicationScopes));
         logger.LogInformation("Opening browser for Graph API admin consent...");
-        TryOpenBrowser(consentUrlGraph);
+        logger.LogInformation("If the browser does not open automatically, navigate to this URL to grant consent: {ConsentUrl}", consentUrlGraph);
+        BrowserHelper.TryOpenUrl(consentUrlGraph, logger);
 
-        var consentSuccess = await AdminConsentHelper.PollAdminConsentAsync(executor, logger, appId, "Graph API Scopes", 180, 5, ct);
+        bool consentSuccess;
+        if (!string.IsNullOrWhiteSpace(blueprintSpId))
+        {
+            consentSuccess = await AdminConsentHelper.PollAdminConsentAsync(
+                graphApiService, logger, tenantId, blueprintSpId,
+                "Graph API Scopes", 180, 5, ct);
+        }
+        else
+        {
+            logger.LogDebug("Could not resolve blueprint service principal. Falling back to az rest polling.");
+            consentSuccess = await AdminConsentHelper.PollAdminConsentAsync(executor, logger, appId, "Graph API Scopes", 180, 5, ct);
+        }
 
         bool graphInheritablePermissionsConfigured = false;
         string? graphInheritablePermissionsError = null;
@@ -1541,23 +1599,6 @@ internal static class BlueprintSubcommand
         }
     }
 
-    private static void TryOpenBrowser(string url)
-    {
-        try
-        {
-            using var p = new System.Diagnostics.Process();
-            p.StartInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            };
-            p.Start();
-        }
-        catch
-        {
-            // non-fatal
-        }
-    }
 
     /// <summary>
     /// Creates client secret for Agent Blueprint (Phase 2.5)

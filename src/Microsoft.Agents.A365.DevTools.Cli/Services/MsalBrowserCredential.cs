@@ -22,11 +22,12 @@ namespace Microsoft.Agents.A365.DevTools.Cli.Services;
 /// Uses Microsoft.Identity.Client.Extensions.Msal to persist tokens across all CLI instances.
 /// This dramatically reduces authentication prompts during multi-step operations like 'a365 setup all'.
 ///
-/// Cache Location: %LocalApplicationData%\Agent365\msal-token-cache (Windows)
-/// Security: Tokens are encrypted at rest using platform-appropriate mechanisms:
-///   - Windows: DPAPI (Data Protection API) - tokens encrypted with user credentials
-///   - macOS: Keychain - tokens stored in secure keychain
-///   - Linux: Persistent caching is disabled (no platform encryption available); tokens remain in-memory only
+/// Cache Location: [LocalApplicationData]/Agent365/msal-token-cache (Windows/macOS)
+/// Security: Tokens are stored using platform-appropriate mechanisms:
+///   - Windows: DPAPI (Data Protection API) - tokens encrypted with user credentials, persisted to disk
+///   - macOS: Keychain - tokens stored in secure keychain, persisted to disk
+///   - Linux: Shared in-memory cache (static, in-process) - tokens never written to disk, shared
+///            across all MsalBrowserCredential instances in the same CLI process to avoid repeated prompts
 ///
 /// See: https://learn.microsoft.com/en-us/entra/msal/dotnet/acquiring-tokens/desktop-mobile/wam
 /// Enhancement: Improves the WAM authentication experience by reducing repeated login prompts.
@@ -43,6 +44,13 @@ public sealed class MsalBrowserCredential : TokenCredential
     // This is the key to reducing multiple WAM prompts during setup operations.
     private static MsalCacheHelper? _cacheHelper;
     private static readonly object _cacheHelperLock = new();
+
+    // Linux-only: shared in-memory token cache, serialized as MSAL V3 format.
+    // Shared across all MsalBrowserCredential instances in the same CLI process so that
+    // a second auth call (e.g., client secret creation) can reuse the token from the first
+    // interactive sign-in without triggering another device code prompt.
+    private static byte[] _linuxInMemoryCacheBytes = Array.Empty<byte>();
+    private static readonly object _linuxCacheLock = new();
     private static readonly string CacheFileName = "msal-token-cache";
     private static readonly string CacheDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -146,25 +154,27 @@ public sealed class MsalBrowserCredential : TokenCredential
     }
 
     /// <summary>
-    /// Registers a persistent cross-process token cache with the MSAL application.
-    /// The cache is shared across all instances of MsalBrowserCredential within this CLI process
-    /// and persists to disk for reuse across CLI invocations.
+    /// Registers a shared token cache with the MSAL application.
+    /// The cache is shared across all MsalBrowserCredential instances within this CLI process.
     ///
-    /// Security: Uses platform-appropriate encryption (DPAPI on Windows, Keychain on macOS).
-    /// On Linux, persistent caching is skipped to avoid storing tokens in plaintext on disk.
+    /// Security: Uses platform-appropriate storage:
+    ///   - Windows: DPAPI-encrypted file, persisted across CLI invocations
+    ///   - macOS: Keychain-backed file, persisted across CLI invocations
+    ///   - Linux: In-memory only (shared in-process via static bytes), not persisted to disk
     /// </summary>
     private static void RegisterPersistentCache(IPublicClientApplication app, ILogger? logger)
     {
         try
         {
-            // Skip persistent caching on Linux to avoid storing tokens in plaintext on disk.
-            // Linux lacks a platform-provided encryption mechanism (libsecret/Keyring requires
-            // additional setup that cannot be guaranteed). Users on Linux will see repeated
-            // authentication prompts but their tokens remain safely in-memory only.
+            // Linux: no secure file storage available, but share tokens across all instances
+            // within this CLI process using a static in-memory serialized cache.
+            // This eliminates repeated device code prompts during multi-step operations
+            // (e.g., blueprint creation followed by client secret creation in 'setup blueprint').
+            // Tokens are never written to disk on Linux.
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
                 !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             {
-                logger?.LogDebug("Skipping persistent token cache on Linux - no platform encryption available. Tokens will be in-memory only.");
+                RegisterSharedInMemoryCache(app, logger);
                 return;
             }
 
@@ -224,6 +234,36 @@ public sealed class MsalBrowserCredential : TokenCredential
             // but users may see more prompts during multi-step operations
             logger?.LogWarning(ex, "Failed to register persistent token cache. Authentication prompts may be repeated.");
         }
+    }
+
+    /// <summary>
+    /// Registers a shared in-memory token cache for Linux platforms.
+    /// Tokens are not persisted to disk, but are shared across all MsalBrowserCredential
+    /// instances within the current CLI process, eliminating repeated auth prompts within
+    /// a single command invocation (e.g., blueprint creation + client secret creation).
+    /// </summary>
+    private static void RegisterSharedInMemoryCache(IPublicClientApplication app, ILogger? logger)
+    {
+        app.UserTokenCache.SetBeforeAccess(args =>
+        {
+            lock (_linuxCacheLock)
+            {
+                args.TokenCache.DeserializeMsalV3(_linuxInMemoryCacheBytes);
+            }
+        });
+
+        app.UserTokenCache.SetAfterAccess(args =>
+        {
+            if (args.HasStateChanged)
+            {
+                lock (_linuxCacheLock)
+                {
+                    _linuxInMemoryCacheBytes = args.TokenCache.SerializeMsalV3();
+                }
+            }
+        });
+
+        logger?.LogDebug("Registered shared in-memory token cache for Linux (in-process only, not persisted to disk).");
     }
 
     /// <inheritdoc/>
@@ -315,13 +355,100 @@ public sealed class MsalBrowserCredential : TokenCredential
         }
         catch (PlatformNotSupportedException ex)
         {
+            // macOS: MSAL throws PlatformNotSupportedException when no browser is available
             _logger?.LogWarning("Browser authentication is not supported on this platform: {Message}", ex.Message);
-            throw new MsalAuthenticationFailedException($"Browser authentication is not supported on this platform ({ex.Message})", ex);
+            return await AcquireTokenWithDeviceCodeFallbackAsync(scopes, cancellationToken);
+        }
+        catch (MsalClientException ex) when (ex.ErrorCode == "linux_xdg_open_failed")
+        {
+            // Linux/WSL: MSAL throws MsalClientException when xdg-open and friends are unavailable
+            _logger?.LogWarning("Browser cannot be opened on this platform: {Message}", ex.Message);
+            return await AcquireTokenWithDeviceCodeFallbackAsync(scopes, cancellationToken);
         }
         catch (MsalException ex)
         {
             _logger?.LogError(ex, "MSAL authentication failed: {Message}", ex.Message);
             throw new MsalAuthenticationFailedException($"Failed to acquire token: {ex.Message}", ex);
+        }
+    }
+
+    private async Task<AccessToken> AcquireTokenWithDeviceCodeFallbackAsync(
+        string[] scopes,
+        CancellationToken cancellationToken)
+    {
+        // Before showing a device code, try to get a cached token.
+        // On Linux, the shared in-process cache may already hold a token from an earlier
+        // authentication step in the same CLI invocation (e.g., blueprint creation),
+        // which can be reused silently without prompting the user again.
+        var accountsList = (await _publicClientApp.GetAccountsAsync()).ToList();
+        // Filter by tenant to avoid silently authenticating as the wrong identity when multiple accounts are cached.
+        // If multiple accounts share the same tenant (rare), FirstOrDefault picks the first match; this is acceptable
+        // since MSAL will re-prompt if the silent acquisition fails for the wrong account.
+        var cachedAccount = accountsList.Count switch
+        {
+            0 => null,
+            1 => accountsList[0],
+            _ => accountsList.FirstOrDefault(a =>
+                string.Equals(a.HomeAccountId?.TenantId, _tenantId, StringComparison.OrdinalIgnoreCase))
+        };
+        if (cachedAccount != null)
+        {
+            try
+            {
+                _logger?.LogDebug("Attempting silent token acquisition before device code...");
+                var silentResult = await _publicClientApp
+                    .AcquireTokenSilent(scopes, cachedAccount)
+                    .ExecuteAsync(cancellationToken);
+                _logger?.LogDebug("Acquired token silently, skipping device code prompt.");
+                return new AccessToken(silentResult.AccessToken, silentResult.ExpiresOn);
+            }
+            catch (MsalUiRequiredException)
+            {
+                _logger?.LogDebug("Silent acquisition failed, proceeding with device code.");
+            }
+        }
+
+        _logger?.LogInformation("Falling back to device code authentication...");
+        _logger?.LogInformation("Please sign in with your Microsoft account");
+
+        try
+        {
+            var deviceCodeResult = await _publicClientApp
+                .AcquireTokenWithDeviceCode(scopes, deviceCode =>
+                {
+                    _logger?.LogInformation("");
+                    _logger?.LogInformation("==========================================================================");
+                    _logger?.LogInformation("To sign in, use a web browser to open the page:");
+                    _logger?.LogInformation("    {VerificationUrl}", deviceCode.VerificationUrl);
+                    _logger?.LogInformation("");
+                    _logger?.LogInformation("And enter the code: {UserCode}", deviceCode.UserCode);
+                    _logger?.LogInformation("==========================================================================");
+                    _logger?.LogInformation("");
+                    return Task.CompletedTask;
+                })
+                .ExecuteAsync(cancellationToken);
+
+            _logger?.LogDebug("Successfully acquired token via device code authentication.");
+            return new AccessToken(deviceCodeResult.AccessToken, deviceCodeResult.ExpiresOn);
+        }
+        catch (MsalException msalEx) when (
+            msalEx.Message.Contains("AADSTS7000218", StringComparison.Ordinal) ||
+            (msalEx is MsalServiceException svcEx && svcEx.ErrorCode == "invalid_client" &&
+             msalEx.Message.Contains("client_assertion", StringComparison.Ordinal)))
+        {
+            // Do NOT pass msalEx as logger argument — avoids printing the full stack trace.
+            // This error means "Allow public client flows" is disabled on the app registration.
+            _logger?.LogError("Device code authentication failed: 'Allow public client flows' is not enabled on the app registration.");
+            _logger?.LogError("Run 'a365 setup requirements' to detect and auto-fix this automatically.");
+            _logger?.LogError("Or fix manually: Azure Portal > App registrations > Authentication > Settings > Enable 'Allow public client flows' > Save.");
+            throw new MsalAuthenticationFailedException(
+                "Device code authentication requires 'Allow public client flows' to be enabled. Run 'a365 setup requirements' to auto-fix, or enable it manually in Azure Portal > App registrations > Authentication.",
+                msalEx);
+        }
+        catch (MsalException msalEx)
+        {
+            _logger?.LogError(msalEx, "Device code authentication failed: {Message}", msalEx.Message);
+            throw new MsalAuthenticationFailedException($"Device code authentication failed: {msalEx.Message}", msalEx);
         }
     }
 }

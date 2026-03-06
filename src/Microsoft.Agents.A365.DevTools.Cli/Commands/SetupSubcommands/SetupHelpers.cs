@@ -244,10 +244,20 @@ internal static class SetupHelpers
         {
             throw new SetupValidationException(
                 "Failed to authenticate to Microsoft Graph with delegated permissions. " +
-                "Please sign in when prompted and ensure your account has the required roles and permission scopes.");
+                "Check the errors above for the specific cause. Common causes: " +
+                "missing PowerShell module (run 'a365 setup requirements' to install), " +
+                "insufficient permissions, or sign-in was cancelled.");
         }
 
-        var blueprintSpObjectId = await graph.LookupServicePrincipalByAppIdAsync(config.TenantId, config.AgentBlueprintId, ct, permissionGrantScopes);
+        // Retry: Azure AD service principal propagation can lag 10-30s after blueprint creation.
+        var retryHelperSp = new RetryHelper(logger);
+        var blueprintSpObjectId = await retryHelperSp.ExecuteWithRetryAsync(
+            operation: (innerCt) => graph.LookupServicePrincipalByAppIdAsync(config.TenantId, config.AgentBlueprintId, innerCt, permissionGrantScopes),
+            shouldRetry: result => string.IsNullOrWhiteSpace(result),
+            maxRetries: 5,
+            baseDelaySeconds: 5,
+            cancellationToken: ct);
+
         if (string.IsNullOrWhiteSpace(blueprintSpObjectId))
         {
             throw new SetupValidationException($"Blueprint Service Principal not found for appId {config.AgentBlueprintId}. " +
@@ -304,11 +314,11 @@ internal static class SetupHelpers
             logger.LogInformation("   - Configuring inheritable permissions: blueprint {Blueprint} to resourceAppId {ResourceAppId} scopes [{Scopes}]",
                 config.AgentBlueprintId, resourceAppId, string.Join(' ', scopes));
 
-            // Use custom client app auth for inheritable permissions - Azure CLI doesn't support this operation
-            var requiredPermissions = new[] { "AgentIdentityBlueprint.UpdateAuthProperties.All", "Application.ReadWrite.All" };
-            
+            // Use custom client app auth for inheritable permissions - Azure CLI doesn't support this operation.
+            // Reuse permissionGrantScopes (which already includes AgentIdentityBlueprint.UpdateAuthProperties.All)
+            // so all Graph PowerShell calls in this method share a single Connect-MgGraph session/cache entry.
             var (ok, alreadyExists, err) = await blueprintService.SetInheritablePermissionsAsync(
-                config.TenantId, config.AgentBlueprintId, resourceAppId, scopes, requiredScopes: requiredPermissions, ct);
+                config.TenantId, config.AgentBlueprintId, resourceAppId, scopes, requiredScopes: permissionGrantScopes, ct);
 
             if (!ok && !alreadyExists)
             {
@@ -338,7 +348,7 @@ internal static class SetupHelpers
                     operation: async (ct) =>
                     {
                         var (exists, verifiedScopes, verifyError) = await blueprintService.VerifyInheritablePermissionsAsync(
-                            config.TenantId, config.AgentBlueprintId, resourceAppId, ct, requiredPermissions);
+                            config.TenantId, config.AgentBlueprintId, resourceAppId, ct, permissionGrantScopes);
                         return (exists, verifiedScopes, verifyError);
                     },
                     shouldRetry: (result) =>

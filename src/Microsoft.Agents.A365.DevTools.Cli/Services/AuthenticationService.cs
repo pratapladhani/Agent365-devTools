@@ -324,7 +324,7 @@ public class AuthenticationService
         cache.Tokens[resourceUrl] = token;
         var updatedJson = JsonSerializer.Serialize(cache, new JsonSerializerOptions { WriteIndented = true });
         await File.WriteAllTextAsync(_tokenCachePath, updatedJson);
-        _logger.LogInformation("Authentication token cached for {ResourceUrl} at: {Path}", resourceUrl, _tokenCachePath);
+        _logger.LogDebug("Authentication token cached for {ResourceUrl} at: {Path}", resourceUrl, _tokenCachePath);
     }
 
     /// <summary>
@@ -535,14 +535,14 @@ public class AuthenticationService
             },
             DeviceCodeCallback = (code, cancellation) =>
             {
-                Console.WriteLine();
-                Console.WriteLine("==========================================================================");
-                Console.WriteLine($"To sign in, use a web browser to open the page:");
-                Console.WriteLine($"    {code.VerificationUri}");
-                Console.WriteLine();
-                Console.WriteLine($"And enter the code: {code.UserCode}");
-                Console.WriteLine("==========================================================================");
-                Console.WriteLine();
+                _logger.LogInformation("");
+                _logger.LogInformation("==========================================================================");
+                _logger.LogInformation("To sign in, use a web browser to open the page:");
+                _logger.LogInformation("    {VerificationUri}", code.VerificationUri);
+                _logger.LogInformation("");
+                _logger.LogInformation("And enter the code: {UserCode}", code.UserCode);
+                _logger.LogInformation("==========================================================================");
+                _logger.LogInformation("");
                 return Task.CompletedTask;
             }
         });

@@ -76,13 +76,27 @@ internal static class PermissionsSubcommand
             if (string.IsNullOrWhiteSpace(setupConfig.AgentBlueprintId))
             {
                 logger.LogError("Blueprint ID not found. Run 'a365 setup blueprint' first.");
-                Environment.Exit(1);
+                ExceptionHandler.ExitWithCleanup(1);
             }
 
             // Configure GraphApiService with custom client app ID if available
             if (!string.IsNullOrWhiteSpace(setupConfig.ClientAppId))
             {
                 graphApiService.CustomClientAppId = setupConfig.ClientAppId;
+            }
+
+            // Verify system requirements (PowerShell modules are required for Graph operations).
+            // Skipped in dry-run: PowerShellModulesRequirementCheck can auto-install modules,
+            // which would be a side effect in a mode that is supposed to be non-mutating.
+            if (!dryRun)
+            {
+                var mcpSystemChecksOk = await RequirementsSubcommand.RunRequirementChecksAsync(
+                    RequirementsSubcommand.GetSystemRequirementChecks(), setupConfig, logger, category: null, CancellationToken.None);
+                if (!mcpSystemChecksOk)
+                {
+                    logger.LogError("Setup cannot proceed due to failed requirement checks above. Please fix the issues and retry.");
+                    ExceptionHandler.ExitWithCleanup(1);
+                }
             }
 
             if (dryRun)
@@ -154,13 +168,27 @@ internal static class PermissionsSubcommand
             if (string.IsNullOrWhiteSpace(setupConfig.AgentBlueprintId))
             {
                 logger.LogError("Blueprint ID not found. Run 'a365 setup blueprint' first.");
-                Environment.Exit(1);
+                ExceptionHandler.ExitWithCleanup(1);
             }
 
             // Configure GraphApiService with custom client app ID if available
             if (!string.IsNullOrWhiteSpace(setupConfig.ClientAppId))
             {
                 graphApiService.CustomClientAppId = setupConfig.ClientAppId;
+            }
+
+            // Verify system requirements (PowerShell modules are required for Graph operations).
+            // Skipped in dry-run: PowerShellModulesRequirementCheck can auto-install modules,
+            // which would be a side effect in a mode that is supposed to be non-mutating.
+            if (!dryRun)
+            {
+                var botSystemChecksOk = await RequirementsSubcommand.RunRequirementChecksAsync(
+                    RequirementsSubcommand.GetSystemRequirementChecks(), setupConfig, logger, category: null, CancellationToken.None);
+                if (!botSystemChecksOk)
+                {
+                    logger.LogError("Setup cannot proceed due to failed requirement checks above. Please fix the issues and retry.");
+                    ExceptionHandler.ExitWithCleanup(1);
+                }
             }
 
             if (dryRun)
@@ -228,13 +256,27 @@ internal static class PermissionsSubcommand
             if (string.IsNullOrWhiteSpace(setupConfig.AgentBlueprintId))
             {
                 logger.LogError("Blueprint ID not found. Run 'a365 setup blueprint' first.");
-                Environment.Exit(1);
+                ExceptionHandler.ExitWithCleanup(1);
             }
 
             // Configure GraphApiService with custom client app ID if available
             if (!string.IsNullOrWhiteSpace(setupConfig.ClientAppId))
             {
                 graphApiService.CustomClientAppId = setupConfig.ClientAppId;
+            }
+
+            // Verify system requirements (PowerShell modules are required for Graph operations).
+            // Skipped in dry-run: PowerShellModulesRequirementCheck can auto-install modules,
+            // which would be a side effect in a mode that is supposed to be non-mutating.
+            if (!dryRun)
+            {
+                var customSystemChecksOk = await RequirementsSubcommand.RunRequirementChecksAsync(
+                    RequirementsSubcommand.GetSystemRequirementChecks(), setupConfig, logger, category: null, CancellationToken.None);
+                if (!customSystemChecksOk)
+                {
+                    logger.LogError("Setup cannot proceed due to failed requirement checks above. Please fix the issues and retry.");
+                    ExceptionHandler.ExitWithCleanup(1);
+                }
             }
 
             if (dryRun)
@@ -466,7 +508,10 @@ internal static class PermissionsSubcommand
             AuthenticationConstants.MicrosoftGraphResourceAppId,
         };
 
-        var requiredPermissions = new[] { "AgentIdentityBlueprint.UpdateAuthProperties.All", "Application.ReadWrite.All" };
+        // Must match RequiredPermissionGrantScopes exactly so the PowerShell token acquired
+        // for inheritable permissions is reused (same cache key) rather than triggering
+        // a second Connect-MgGraph prompt.
+        var requiredPermissions = AuthenticationConstants.RequiredPermissionGrantScopes;
 
         List<(string ResourceAppId, List<string> Scopes)> currentPermissions;
         try
@@ -614,7 +659,7 @@ internal static class PermissionsSubcommand
 
             if (setupConfig.CustomBlueprintPermissions == null || setupConfig.CustomBlueprintPermissions.Count == 0)
             {
-                logger.LogInformation("No custom blueprint permissions configured.");
+                logger.LogInformation("No custom blueprint permissions specified in config. Skipping.");
                 await configService.SaveStateAsync(setupConfig);
                 return true;
             }
